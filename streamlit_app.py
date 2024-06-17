@@ -38,3 +38,222 @@ st.altair_chart(alt.Chart(df, height=700, width=700)
         color=alt.Color("idx", legend=None, scale=alt.Scale()),
         size=alt.Size("rand", legend=None, scale=alt.Scale(range=[1, 150])),
     ))
+
+
+import pandas as pd
+import requests
+import os
+import yfinance as yf
+from datetime import datetime, timedelta
+import time
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Fetch actual stock prices from Yahoo Finance and save as CSV
+def fetch_and_save_actual_prices(ticker: str) -> None:
+    try:
+        data = yf.download(ticker, start="2000-01-01", end=datetime.today().strftime('%Y-%m-%d'))
+        filename = f"{ticker}_Historical_prices.csv"
+        data.to_csv(filename)
+        print(f"Actual prices for {ticker} downloaded and saved successfully as {filename}.")
+    except Exception as e:
+        print(f"Error fetching and saving actual prices: {e}")
+
+# Load stock data from CSV or fetch if CSV is older than 1 day
+def load_stock_data(ticker: str) -> pd.DataFrame:
+    filename = f"{ticker}_Historical_prices.csv"
+    if os.path.exists(filename):
+        modification_time = os.path.getmtime(filename)
+        if (time.time() - modification_time) > 86400:  # 86400 seconds = 1 day
+            fetch_and_save_actual_prices(ticker)
+    else:
+        fetch_and_save_actual_prices(ticker)
+
+    try:
+        return pd.read_csv(filename)
+    except FileNotFoundError:
+        print(f"Error: File {filename} not found.")
+        return None
+
+# Process stock data to calculate changes over specified periods
+def process_stock_data(data: pd.DataFrame, years: int, days: int) -> pd.DataFrame:
+    try:
+        data['Date'] = pd.to_datetime(data['Date'], utc=True)
+        data['Date'] = data['Date'].dt.tz_localize(None)
+    except KeyError:
+        print("Error: 'Date' column not found in the CSV file.")
+        return None
+
+    start_date = pd.Timestamp.now() - pd.DateOffset(years=years)
+    data = data.loc[data['Date'] >= start_date].copy()
+
+    change_col_name = f'{days} Day Change (%)'
+    start_col_name = f'Close at Start {days}-day'
+    end_col_name = f'Close at End {days}-day'
+
+    data[change_col_name] = ((data['Close'].shift(-days) - data['Close']) / data['Close']) * 100
+    data[start_col_name] = data['Close'].copy()
+    data[end_col_name] = data['Close'].shift(-days).copy()
+
+    return data
+
+# Filter top periods based on specified column and criteria
+def filter_top_periods(data: pd.DataFrame, column: str, days: int = 20, worst: bool = False) -> pd.DataFrame:
+    sorted_data = data.sort_values(by=column, ascending=worst)
+    filtered_periods = []
+    for index, row in sorted_data.iterrows():
+        if all(abs((row['Date'] - d).days) > days for d in filtered_periods):
+            filtered_periods.append(row['Date'])
+            if len(filtered_periods) == 10:
+                break
+    return data[data['Date'].isin(filtered_periods)]
+
+# Format the percentage change values and sort the DataFrame by the absolute change
+def format_change(df: pd.DataFrame, column: str, sort_ascending: bool = False) -> pd.DataFrame:
+    df = df.copy()
+    df[column + ' Formatted'] = df[column].apply(lambda x: f"{x:.1f}%")
+    df.insert(0, 'Row', range(1, 1 + len(df)))
+    return df.sort_values(by=column, ascending=sort_ascending)
+
+# Get the name of the stock from its ticker symbol
+def get_stock_name(ticker: str) -> str:
+    try:
+        stock_info = yf.Ticker(ticker).info
+        return stock_info['longName']
+    except Exception as e:
+        print(f"Error fetching stock name: {e}")
+        return None
+
+# Fetch news articles for the stock from New York Times
+def fetch_news(stock_name: str, worst_periods_dates: pd.Series) -> None:
+    apikey = os.getenv('NYTIMES_APIKEY', 'dbFNBHoE0eNf95ysIwrCp0fWSRgPy1cD')
+
+    for i, worst_date in enumerate(worst_periods_dates):
+        if i % 2 == 0:
+            start_date = pd.to_datetime(worst_date)
+            end_date = start_date + timedelta(days=10)
+
+            start_date_str_api = start_date.strftime('%Y%m%d')
+            end_date_str_api = end_date.strftime('%Y%m%d')
+            
+            # Format dates for printing
+            start_date_str_print = start_date.strftime('%Y-%m-%d')
+            end_date_str_print = end_date.strftime('%Y-%m-%d')
+
+            query_url = f"https://api.nytimes.com/svc/search/v2/articlesearch.json?q={stock_name}&begin_date={start_date_str_api}&end_date={end_date_str_api}&api-key={apikey}"
+            
+            try:
+                response = requests.get(query_url)
+                if response.status_code == 200:
+                    data = response.json()
+                    articles = [(datetime.strptime(article.get('pub_date', ''), '%Y-%m-%dT%H:%M:%S%z'),
+                                 article.get('headline', {}).get('main', ''),
+                                 article.get('web_url', ''))
+                                for article in data.get('response', {}).get('docs', [])]
+
+                    articles.sort(key=lambda x: x[0])
+
+                    print(f"\nNews articles for the period {start_date_str_print} to {end_date_str_print}:")
+                    for pub_date, headline, web_url in articles:
+                        formatted_date = pub_date.strftime('%d.%m.%Y')
+                        print(f"{formatted_date}: {headline} - {web_url}")
+                else:
+                    print(f"Error: {response.status_code} - {response.reason}")
+
+                time.sleep(1)
+
+            except requests.RequestException as e:
+                print(f"Network error: {e}")
+
+            except ValueError as e:
+                print(f"JSON decoding error: {e}")
+
+# Visualize top and bottom periods with sorted results
+def visualize_periods(best_periods, worst_periods, days):
+    plt.figure(figsize=(10, 6))
+
+    # Sort the dataframes by the change percentage
+    best_periods = best_periods.sort_values(by=f'{days} Day Change (%)', ascending=False)
+    worst_periods = worst_periods.sort_values(by=f'{days} Day Change (%)')
+
+    # Plot top periods
+    plt.barh(best_periods['Date'].dt.strftime('%d.%m.%Y'), best_periods[f'{days} Day Change (%)'], color='green', label='Top Periods')
+
+    # Plot bottom periods
+    plt.barh(worst_periods['Date'].dt.strftime('%d.%m.%Y'), worst_periods[f'{days} Day Change (%)'], color='red', label='Bottom Periods')
+
+    plt.xlabel('Change (%)')
+    plt.ylabel('Date')
+    plt.title(f'Top and Bottom Periods with the Highest and Lowest Changes ({days}-day)')
+    plt.legend()
+    plt.grid(axis='x')
+    plt.tight_layout()
+    plt.show()
+
+
+
+# Main function
+def main() -> None:
+    ticker = input("Enter the ticker: ")
+    stock_data = load_stock_data(ticker)
+    if stock_data is not None:
+        yy = int(input("Analysis for last yy years: "))
+        days = int(input("Enter x-days changes: "))
+        processed_data = process_stock_data(stock_data, yy, days)
+        if processed_data is not None:
+            change_col_name = f'{days} Day Change (%)'
+            start_col_name = f'Close at Start {days}-day'
+            end_col_name = f'Close at End {days}-day'
+
+            best_periods = filter_top_periods(processed_data, change_col_name)
+            worst_periods = filter_top_periods(processed_data, change_col_name, worst=True)
+
+            best_periods = format_change(best_periods, change_col_name)
+            worst_periods = format_change(worst_periods, change_col_name, sort_ascending=True)  # Sort by absolute change
+
+            print("\n")
+
+            print(f"Top 10 periods with the highest {days}-day change:")
+            print(best_periods[['Row', 'Date', f'{change_col_name} Formatted', start_col_name, end_col_name]]
+                  .rename(columns={'Date': 'Start Date'})
+                  .round({start_col_name: 1, end_col_name: 1}))
+            
+            print("\n")
+
+            print(f"\nTop 10 periods with the lowest {days}-day change:")
+            print(worst_periods[['Row', 'Date', f'{change_col_name} Formatted', start_col_name, end_col_name]]
+                  .rename(columns={'Date': 'Start Date'})
+                  .round({start_col_name: 1, end_col_name: 1}))
+
+            print("\n")
+
+            # Visualize top and bottom periods
+            visualize_periods(best_periods, worst_periods, days)
+           
+            
+            print("\n")
+
+            # New Extra row for X days change
+            x_days_change = ((processed_data['Close'].iloc[-1] - processed_data['Close'].iloc[-days-1]) / processed_data['Close'].iloc[-days-1]) * 100
+            # Format all values to have one decimal place
+            x_days_change_formatted = f"{x_days_change:.1f}%"
+            start_close_formatted = f"{processed_data['Close'].iloc[-days-1]:.1f}"
+            end_close_formatted = f"{processed_data['Close'].iloc[-1]:.1f}"
+            new_row = pd.DataFrame([[len(processed_data) + 1, processed_data['Date'].iloc[-1], x_days_change_formatted, start_close_formatted, end_close_formatted]],
+                                    columns=['Row', 'Date', f'{days} Day Change (%)', start_col_name, end_col_name])
+          
+            print(new_row)
+
+            print("\n")
+
+            stock_name = get_stock_name(ticker)
+            if stock_name:
+                print(f"Searching news for {stock_name} ({ticker})...\n")
+                fetch_news(stock_name, worst_periods['Date'])
+            else:
+                print("Failed to fetch stock information.")
+
+if __name__ == "__main__":
+    main()
+
+
